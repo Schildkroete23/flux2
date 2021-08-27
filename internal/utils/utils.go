@@ -17,18 +17,15 @@ limitations under the License.
 package utils
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
-	"text/template"
 
 	"github.com/olekukonko/tablewriter"
 	appsv1 "k8s.io/api/apps/v1"
@@ -38,6 +35,7 @@ import (
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	apiruntime "k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	sigyaml "k8s.io/apimachinery/pkg/util/yaml"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
@@ -45,8 +43,8 @@ import (
 	"sigs.k8s.io/yaml"
 
 	helmv2 "github.com/fluxcd/helm-controller/api/v2beta1"
-	imageautov1 "github.com/fluxcd/image-automation-controller/api/v1alpha2"
-	imagereflectv1 "github.com/fluxcd/image-reflector-controller/api/v1alpha2"
+	imageautov1 "github.com/fluxcd/image-automation-controller/api/v1beta1"
+	imagereflectv1 "github.com/fluxcd/image-reflector-controller/api/v1beta1"
 	kustomizev1 "github.com/fluxcd/kustomize-controller/api/v1beta1"
 	notificationv1 "github.com/fluxcd/notification-controller/api/v1beta1"
 	"github.com/fluxcd/pkg/runtime/dependency"
@@ -109,36 +107,6 @@ func ExecKubectlCommand(ctx context.Context, mode ExecMode, kubeConfigPath strin
 	return "", nil
 }
 
-func ExecTemplate(obj interface{}, tmpl, filename string) error {
-	t, err := template.New("tmpl").Parse(tmpl)
-	if err != nil {
-		return err
-	}
-
-	var data bytes.Buffer
-	writer := bufio.NewWriter(&data)
-	if err := t.Execute(writer, obj); err != nil {
-		return err
-	}
-
-	if err := writer.Flush(); err != nil {
-		return err
-	}
-
-	file, err := os.Create(filename)
-	if err != nil {
-		return err
-	}
-	defer file.Close()
-
-	_, err = io.WriteString(file, data.String())
-	if err != nil {
-		return err
-	}
-
-	return file.Sync()
-}
-
 func KubeConfig(kubeConfigPath string, kubeContext string) (*rest.Config, error) {
 	configFiles := SplitKubeConfigPath(kubeConfigPath)
 	configOverrides := clientcmd.ConfigOverrides{}
@@ -156,15 +124,16 @@ func KubeConfig(kubeConfigPath string, kubeContext string) (*rest.Config, error)
 		return nil, fmt.Errorf("kubernetes configuration load failed: %w", err)
 	}
 
+	// avoid throttling request when some Flux CRDs are not registered
+	cfg.QPS = 50
+	cfg.Burst = 100
+
 	return cfg, nil
 }
 
-func KubeClient(kubeConfigPath string, kubeContext string) (client.Client, error) {
-	cfg, err := KubeConfig(kubeConfigPath, kubeContext)
-	if err != nil {
-		return nil, fmt.Errorf("kubernetes client initialization failed: %w", err)
-	}
-
+// Create the Scheme, methods for serializing and deserializing API objects
+// which can be shared by tests.
+func NewScheme() *apiruntime.Scheme {
 	scheme := apiruntime.NewScheme()
 	_ = apiextensionsv1.AddToScheme(scheme)
 	_ = corev1.AddToScheme(scheme)
@@ -177,8 +146,17 @@ func KubeClient(kubeConfigPath string, kubeContext string) (client.Client, error
 	_ = notificationv1.AddToScheme(scheme)
 	_ = imagereflectv1.AddToScheme(scheme)
 	_ = imageautov1.AddToScheme(scheme)
+	return scheme
+}
 
-	kubeClient, err := client.New(cfg, client.Options{
+func KubeClient(kubeConfigPath string, kubeContext string) (client.WithWatch, error) {
+	cfg, err := KubeConfig(kubeConfigPath, kubeContext)
+	if err != nil {
+		return nil, fmt.Errorf("kubernetes client initialization failed: %w", err)
+	}
+
+	scheme := NewScheme()
+	kubeClient, err := client.NewWithWatch(cfg, client.Options{
 		Scheme: scheme,
 	})
 	if err != nil {
@@ -221,6 +199,21 @@ func ContainsEqualFoldItemString(s []string, e string) (string, bool) {
 	return "", false
 }
 
+// ParseNamespacedName extracts the NamespacedName of a resource
+// based on the '<namespace>/<name>' format
+func ParseNamespacedName(input string) types.NamespacedName {
+	parts := strings.Split(input, "/")
+	if len(parts) == 2 {
+		return types.NamespacedName{
+			Namespace: parts[0],
+			Name:      parts[1],
+		}
+	}
+	return types.NamespacedName{
+		Name: input,
+	}
+}
+
 // ParseObjectKindName extracts the kind and name of a resource
 // based on the '<kind>/<name>' format
 func ParseObjectKindName(input string) (kind, name string) {
@@ -235,11 +228,7 @@ func ParseObjectKindName(input string) (kind, name string) {
 // ParseObjectKindNameNamespace extracts the kind, name and namespace of a resource
 // based on the '<kind>/<name>.<namespace>' format
 func ParseObjectKindNameNamespace(input string) (kind, name, namespace string) {
-	name = input
-	parts := strings.Split(input, "/")
-	if len(parts) == 2 {
-		kind, name = parts[0], parts[1]
-	}
+	kind, name = ParseObjectKindName(input)
 
 	if nn := strings.Split(name, "."); len(nn) > 1 {
 		name = strings.Join(nn[:len(nn)-1], ".")
@@ -320,7 +309,7 @@ func CompatibleVersion(binary, target string) bool {
 }
 
 func ExtractCRDs(inManifestPath, outManifestPath string) error {
-	manifests, err := ioutil.ReadFile(inManifestPath)
+	manifests, err := os.ReadFile(inManifestPath)
 	if err != nil {
 		return err
 	}
@@ -354,5 +343,5 @@ func ExtractCRDs(inManifestPath, outManifestPath string) error {
 		return fmt.Errorf("no CRDs found in %s", inManifestPath)
 	}
 
-	return ioutil.WriteFile(outManifestPath, []byte(crds), os.ModePerm)
+	return os.WriteFile(outManifestPath, []byte(crds), os.ModePerm)
 }

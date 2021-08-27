@@ -19,7 +19,6 @@ package main
 import (
 	"context"
 	"fmt"
-	"io/ioutil"
 	"net/url"
 	"os"
 	"strings"
@@ -30,7 +29,6 @@ import (
 	"github.com/go-git/go-git/v5/plumbing/transport/ssh"
 	"github.com/manifoldco/promptui"
 	"github.com/spf13/cobra"
-	cryptossh "golang.org/x/crypto/ssh"
 	corev1 "k8s.io/api/core/v1"
 
 	"github.com/fluxcd/flux2/internal/bootstrap"
@@ -70,6 +68,7 @@ type gitFlags struct {
 	path     flags.SafeRelativePath
 	username string
 	password string
+	silent   bool
 }
 
 var gitArgs gitFlags
@@ -80,6 +79,7 @@ func init() {
 	bootstrapGitCmd.Flags().Var(&gitArgs.path, "path", "path relative to the repository root, when specified the cluster sync will be scoped to this path")
 	bootstrapGitCmd.Flags().StringVarP(&gitArgs.username, "username", "u", "git", "basic authentication username")
 	bootstrapGitCmd.Flags().StringVarP(&gitArgs.password, "password", "p", "", "basic authentication password")
+	bootstrapGitCmd.Flags().BoolVarP(&gitArgs.silent, "silent", "s", false, "assumes the deploy key is already setup, skips confirmation")
 
 	bootstrapCmd.AddCommand(bootstrapGitCmd)
 }
@@ -117,7 +117,7 @@ func bootstrapGitCmdRun(cmd *cobra.Command, args []string) error {
 	defer os.RemoveAll(manifestsBase)
 
 	// Lazy go-git repository
-	tmpDir, err := ioutil.TempDir("", "flux-bootstrap-")
+	tmpDir, err := os.MkdirTemp("", "flux-bootstrap-")
 	if err != nil {
 		return fmt.Errorf("failed to create temporary working dir: %w", err)
 	}
@@ -233,20 +233,7 @@ func transportForURL(u *url.URL) (transport.AuthMethod, error) {
 		}, nil
 	case "ssh":
 		if bootstrapArgs.privateKeyFile != "" {
-			// TODO(hidde): replace custom logic with https://github.com/go-git/go-git/pull/298
-			//  once made available in go-git release.
-			bytes, err := ioutil.ReadFile(bootstrapArgs.privateKeyFile)
-			if err != nil {
-				return nil, err
-			}
-			signer, err := cryptossh.ParsePrivateKey(bytes)
-			if _, ok := err.(*cryptossh.PassphraseMissingError); ok {
-				signer, err = cryptossh.ParsePrivateKeyWithPassphrase(bytes, []byte(gitArgs.password))
-			}
-			if err != nil {
-				return nil, err
-			}
-			return &ssh.PublicKeys{Signer: signer, User: u.User.Username()}, nil
+			return ssh.NewPublicKeysFromFile(u.User.Username(), bootstrapArgs.privateKeyFile, gitArgs.password)
 		}
 		return nil, nil
 	default:
@@ -261,13 +248,16 @@ func promptPublicKey(ctx context.Context, secret corev1.Secret, _ sourcesecret.O
 	}
 
 	logger.Successf("public key: %s", strings.TrimSpace(ppk))
-	prompt := promptui.Prompt{
-		Label:     "Please give the key access to your repository",
-		IsConfirm: true,
-	}
-	_, err := prompt.Run()
-	if err != nil {
-		return fmt.Errorf("aborting")
+
+	if !gitArgs.silent {
+		prompt := promptui.Prompt{
+			Label:     "Please give the key access to your repository",
+			IsConfirm: true,
+		}
+		_, err := prompt.Run()
+		if err != nil {
+			return fmt.Errorf("aborting")
+		}
 	}
 	return nil
 }

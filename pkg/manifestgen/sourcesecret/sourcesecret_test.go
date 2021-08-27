@@ -1,3 +1,5 @@
+// +build !e2e
+
 /*
 Copyright 2021 The Flux authors
 
@@ -17,7 +19,6 @@ limitations under the License.
 package sourcesecret
 
 import (
-	"io/ioutil"
 	"os"
 	"reflect"
 	"testing"
@@ -43,8 +44,8 @@ func Test_passwordLoadKeyPair(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			pk, _ := ioutil.ReadFile(tt.privateKeyPath)
-			ppk, _ := ioutil.ReadFile(tt.publicKeyPath)
+			pk, _ := os.ReadFile(tt.privateKeyPath)
+			ppk, _ := os.ReadFile(tt.publicKeyPath)
 
 			got, err := loadKeyPair(tt.privateKeyPath, tt.password)
 			if err != nil {
@@ -65,7 +66,7 @@ func Test_passwordLoadKeyPair(t *testing.T) {
 func Test_PasswordlessLoadKeyPair(t *testing.T) {
 	for algo, privateKey := range testdata.PEMBytes {
 		t.Run(algo, func(t *testing.T) {
-			f, err := ioutil.TempFile("", "test-private-key-")
+			f, err := os.CreateTemp("", "test-private-key-")
 			if err != nil {
 				t.Fatalf("unable to create temporary file. err: %s", err)
 			}
@@ -81,7 +82,7 @@ func Test_PasswordlessLoadKeyPair(t *testing.T) {
 				return
 			}
 
-			pk, _ := ioutil.ReadFile(f.Name())
+			pk, _ := os.ReadFile(f.Name())
 			if !reflect.DeepEqual(got.PrivateKey, pk) {
 				t.Errorf("PrivateKey %s != %s", got.PrivateKey, string(privateKey))
 			}

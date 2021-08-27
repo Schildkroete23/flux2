@@ -1,0 +1,2 @@
+► suspending kustomizations tkfg in {{ .ns }} namespace
+✔ kustomizations suspended
